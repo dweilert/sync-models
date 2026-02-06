@@ -16,7 +16,7 @@ services:
       - ./data:/home/app
 
       # Your models on the host -> /models in the container
-      - /opt/ai/models:/models
+      - /opt/ai/comfy/models:/models
 
       # SSH keys/config for rsync/ssh
       # NOTE: needs to be writable if ssh will write known_hosts.
