@@ -1,31 +1,28 @@
-
 #!/usr/bin/env python3
 """
-Model Sync App (v1.3.1)
+Model Sync App (v1.3)
 
 Run this on BOTH machines.
-
 Features:
 - Web UI (no auth) for home LAN
 - Configure local root + remote URL + remote root
-- Local tree always renders even if remote unreachable
+- Compare trees (local always renders even if remote unreachable)
 - Drag & drop file copy local<->remote
-- Prefer rsync over SSH for big model files/folders (with diagnostics + version-safe progress flags)
-- HTTP streaming fallback for file copy (files only; no directory HTTP)
+- Prefer rsync over SSH for big model files/folders
+- HTTP streaming fallback for file copy (not directories)
 - Download a URL (HuggingFace or any direct URL) on local/remote/both
-  - Shows equivalent modern `hf download` command in job log when URL is HF /resolve/
-- Job status + progress
-- Peer check loop (health ping) at configurable interval via --peer-poll-seconds + UI indicator
-- NEW v1.3+: Two sync buttons
-    - "Sync Local → Remote" (push)
-    - "Sync Remote → Local" (pull)
-  Sync strategy:
-    - Builds both trees (to max_depth), compares files by relpath
-    - Copies files that are missing or different size/mtime (mtime tolerance)
-    - Creates missing directories on the TARGET before copying
-    - Uses rsync for any directory copy if needed; otherwise file-by-file copies are used
-  Constraints:
-    - Intended for <= ~500 files (as you said) and “anytime” usage
+- Job status + progress + logs
+- Peer check loop (health ping) at configurable interval via --peer-poll-seconds
+- Sync buttons (<=500 files): Sync Local->Remote and Sync Remote->Local
+  - Sync compares SIZE first
+  - If sizes match, it only uses MTIME when "mtime strict" toggle is enabled
+  - MTIME uses a tolerance (default 2s) to avoid filesystem timestamp quirks
+
+Start:
+  python model_sync_app.py --host 0.0.0.0 --port 9090 --peer-poll-seconds 10
+
+Open:
+  http://<machine-ip>:9090
 """
 
 from __future__ import annotations
@@ -55,7 +52,7 @@ from pydantic import BaseModel, Field
 
 CONFIG_FILE = Path.home() / ".model_sync_config.json"
 JOB_LOG_MAX = 400
-SYNC_FILE_LIMIT = 700  # soft limit, you said <500; leave headroom
+SYNC_MAX_FILES = 500  # as requested
 
 
 def now_ts() -> float:
@@ -64,6 +61,10 @@ def now_ts() -> float:
 
 def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
 
 def safe_relpath(p: Path, root: Path) -> str:
@@ -93,6 +94,10 @@ def wait_for_local_file_stable(path: Path, checks: int = 3, interval_sec: float 
                 last = size
         time.sleep(interval_sec)
     return path.stat().st_size == last
+
+
+def mtime_close(a: int, b: int, tol_sec: int = 2) -> bool:
+    return abs(int(a) - int(b)) <= int(tol_sec)
 
 
 def parse_rsync_version(text: str) -> Optional[Tuple[int, int, int]]:
@@ -137,9 +142,12 @@ def human_shell_quote(s: str) -> str:
 def parse_hf_resolve_url(url: str) -> Optional[Tuple[str, str, str]]:
     """
     Parse Hugging Face resolve URL into (repo_id, revision, file_path).
+
     Example:
-      https://huggingface.co/owner/repo/resolve/main/path/to/file.safetensors
+      https://huggingface.co/owner/repo/resolve/main/path/to/file.safetensors?download=true
     -> repo_id="owner/repo", revision="main", file_path="path/to/file.safetensors"
+
+    Returns None if not a recognizable HF resolve URL.
     """
     base = url.split("?", 1)[0].rstrip("/")
     m = re.match(r"^https?://huggingface\.co/([^/]+/[^/]+)/resolve/([^/]+)/(.*)$", base)
@@ -153,10 +161,11 @@ def parse_hf_resolve_url(url: str) -> Optional[Tuple[str, str, str]]:
 
 def build_hf_cli_command(url: str, dest: Path, token: str = "") -> Optional[str]:
     """
-    Build a copy/paste-able modern `hf download` command for a HF /resolve/ URL.
+    Build a copy/paste-able modern `hf download` command for a Hugging Face resolve URL.
 
-    - Uses HF_TOKEN env var for auth
-    - Ensures --local-dir is a DIRECTORY
+    - Uses modern `hf` CLI
+    - Auth via HF_TOKEN env var (if provided)
+    - Ensures --local-dir is a directory (not a filename)
     """
     parsed = parse_hf_resolve_url(url)
     if not parsed:
@@ -170,7 +179,6 @@ def build_hf_cli_command(url: str, dest: Path, token: str = "") -> Optional[str]
         env_prefix = f"HF_TOKEN={human_shell_quote(token)} "
 
     rev_part = ""
-    # Keeping revision explicit only when it isn't main/master
     if revision and revision not in {"main", "master"}:
         rev_part = f"--revision {human_shell_quote(revision)} "
 
@@ -185,8 +193,56 @@ def build_hf_cli_command(url: str, dest: Path, token: str = "") -> Optional[str]
     return cmd
 
 
-def mtime_close(a: int, b: int, tol_sec: int = 2) -> bool:
-    return abs(int(a) - int(b)) <= tol_sec
+def list_files_flat(root: Path, max_files: int = SYNC_MAX_FILES) -> Dict[str, Any]:
+    """
+    Returns a flat listing suitable for sync planning.
+    Includes:
+      - files: { relpath: {size, mtime} }
+      - dirs:  [ relpath_dir, ... ]  (excluding root itself)
+      - truncated: bool
+    """
+    root = root.resolve()
+    if not root.exists() or not root.is_dir():
+        return {"files": {}, "dirs": [], "truncated": False}
+
+    files: Dict[str, Dict[str, int]] = {}
+    dirs: List[str] = []
+    truncated = False
+
+    # Walk directories; stop once we hit max_files
+    for dirpath, dirnames, filenames in os.walk(root):
+        d = Path(dirpath)
+
+        # record directory rel (skip root itself)
+        if d != root:
+            try:
+                rel_dir = safe_relpath(d, root)
+                dirs.append(rel_dir)
+            except Exception:
+                continue
+
+        # ignore noise dirs
+        dirnames[:] = [x for x in dirnames if x not in {".git", "__pycache__"}]
+
+        for fn in filenames:
+            if fn in {".DS_Store"}:
+                continue
+            p = d / fn
+            try:
+                st = p.stat()
+                rel = safe_relpath(p, root)
+            except Exception:
+                continue
+            files[rel] = {"size": int(st.st_size), "mtime": int(st.st_mtime)}
+
+            if len(files) >= max_files:
+                truncated = True
+                break
+
+        if truncated:
+            break
+
+    return {"files": files, "dirs": sorted(set(dirs)), "truncated": truncated}
 
 
 # =============================================================================
@@ -233,9 +289,9 @@ class Job:
     id: str
     kind: str
     created: float
-    status: str            # queued, running, done, error
+    status: str
     message: str = ""
-    progress: float = 0.0  # 0..1
+    progress: float = 0.0
     bytes_done: int = 0
     bytes_total: int = 0
     log: List[str] = None
@@ -338,6 +394,7 @@ def run_rsync(job: Job, src: str, dst: str, ssh: str) -> None:
     ver = get_rsync_version()
     job.add_log(f"Detected rsync version: {ver if ver else 'unknown'} (path={rsync_path})")
 
+    progress_args: List[str]
     if supports_info_progress2(ver):
         progress_args = ["--info=progress2"]
         job.add_log("rsync progress mode: --info=progress2")
@@ -437,7 +494,7 @@ def http_stream_copy_pull(job: Job, remote_url: str, remote_rel: str, local_file
 
 
 # =============================================================================
-# Tree building + flattening
+# Tree building (UI)
 # =============================================================================
 
 def build_tree(root: Path, max_depth: int) -> Dict[str, Any]:
@@ -470,132 +527,6 @@ def build_tree(root: Path, max_depth: int) -> Dict[str, Any]:
     return {"name": root.name, "type": "dir", "children": [node_for(root, 0)]}
 
 
-def flatten_tree(tree: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
-    """
-    Returns:
-      files: relpath -> {size, mtime}
-      dirs: list of relpath directories (no trailing slash)
-    """
-    files: Dict[str, Dict[str, Any]] = {}
-    dirs: List[str] = []
-
-    # tree format: {"children": [rootNode]}
-    root_child = None
-    if tree and isinstance(tree, dict):
-        ch = tree.get("children") or []
-        if ch:
-            root_child = ch[0]
-    if not root_child:
-        return files, dirs
-
-    def walk(node: Dict[str, Any], rel_base: str):
-        ntype = node.get("type")
-        name = node.get("name", "")
-        if ntype == "dir":
-            rel = (rel_base + "/" + name) if rel_base else name
-            if rel:
-                dirs.append(rel)
-            for c in node.get("children") or []:
-                if c.get("type") == "more":
-                    continue
-                walk(c, rel)
-        elif ntype == "file":
-            rel = (rel_base + "/" + name) if rel_base else name
-            files[rel] = {"size": int(node.get("size", 0) or 0), "mtime": int(node.get("mtime", 0) or 0)}
-        else:
-            # missing/more/etc
-            return
-
-    # root_child is the directory itself (root.name). We want children under it, not include root name.
-    if root_child.get("type") == "dir":
-        for c in root_child.get("children") or []:
-            if c.get("type") == "more":
-                continue
-            walk(c, "")
-    return files, dirs
-
-
-def compute_sync_plan(
-    local_tree: Dict[str, Any],
-    remote_tree: Dict[str, Any],
-    direction: str,
-    mtime_tolerance: int = 2,
-) -> Dict[str, Any]:
-    """
-    direction:
-      - "push" = local -> remote
-      - "pull" = remote -> local
-
-    Plan includes:
-      - dirs_to_create (on target)
-      - files_to_copy (relative file paths)
-      - skipped_same (paths)
-    """
-    l_files, l_dirs = flatten_tree(local_tree)
-    r_files, r_dirs = flatten_tree(remote_tree)
-
-    if direction == "push":
-        src_files, src_dirs = l_files, l_dirs
-        dst_files, dst_dirs = r_files, r_dirs
-    else:
-        src_files, src_dirs = r_files, r_dirs
-        dst_files, dst_dirs = l_files, l_dirs
-
-    files_to_copy: List[str] = []
-    skipped_same: List[str] = []
-
-    for rel, smeta in src_files.items():
-        dmeta = dst_files.get(rel)
-        if dmeta is None:
-            files_to_copy.append(rel)
-        else:
-            # Different if size differs OR mtime differs beyond tolerance
-            if int(smeta.get("size", 0)) != int(dmeta.get("size", 0)):
-                files_to_copy.append(rel)
-            else:
-                if not mtime_close(int(smeta.get("mtime", 0)), int(dmeta.get("mtime", 0)), tol_sec=mtime_tolerance):
-                    files_to_copy.append(rel)
-                else:
-                    skipped_same.append(rel)
-
-    # Directories needed on target: for every file, ensure parents exist
-    dirs_needed = set(dst_dirs)
-    dirs_to_create: List[str] = []
-
-    def add_parents(relpath: str):
-        parts = Path(relpath).parts
-        if len(parts) <= 1:
-            return
-        cur = ""
-        for p in parts[:-1]:
-            cur = (cur + "/" + p) if cur else p
-            if cur not in dirs_needed:
-                dirs_needed.add(cur)
-                dirs_to_create.append(cur)
-
-    for f in files_to_copy:
-        add_parents(f)
-
-    # Prevent runaway
-    if len(files_to_copy) > SYNC_FILE_LIMIT:
-        raise RuntimeError(f"Sync plan too large: {len(files_to_copy)} files (limit {SYNC_FILE_LIMIT}). Increase max_depth or narrow root.")
-
-    # Sort dirs shallow->deep
-    dirs_to_create.sort(key=lambda s: (s.count("/"), s.lower()))
-    files_to_copy.sort(key=lambda s: s.lower())
-    return {
-        "direction": direction,
-        "dirs_to_create": dirs_to_create,
-        "files_to_copy": files_to_copy,
-        "skipped_same": skipped_same,
-        "counts": {
-            "dirs_to_create": len(dirs_to_create),
-            "files_to_copy": len(files_to_copy),
-            "skipped_same": len(skipped_same),
-        }
-    }
-
-
 # =============================================================================
 # FastAPI Models
 # =============================================================================
@@ -621,12 +552,15 @@ class CopyIn(BaseModel):
 class UrlDownloadIn(BaseModel):
     url: str
     side: str = Field("both", description="local|remote|both")
-    dest_relpath: str = Field("", description="optional: directory (absolute or relative to local_root)")
+    dest_relpath: str = Field("", description="optional: absolute OR relative-to-local-root download directory")
 
 
 class SyncIn(BaseModel):
     direction: str = Field(..., description="push or pull")
-    mtime_tolerance_sec: int = 2
+    mtime_strict: bool = Field(False, description="Only consider mtime when sizes match AND strict mode is enabled")
+    mtime_tolerance_sec: int = Field(2, description="mtime tolerance in seconds (only used when strict enabled)")
+    max_files: int = Field(SYNC_MAX_FILES, description="safety cap on number of files to consider")
+    dry_run: bool = Field(False, description="plan only; do not enqueue copies")
 
 
 # =============================================================================
@@ -692,8 +626,7 @@ def api_health() -> Dict[str, Any]:
 
 @app.get("/api/peer_status")
 def api_peer_status() -> Dict[str, Any]:
-    ps: PeerStatus = app.state.peer_status
-    return {"ok": ps.ok, "detail": ps.detail, "last_check": int(ps.last_check)}
+    return asdict(app.state.peer_status)
 
 
 @app.get("/api/config")
@@ -722,7 +655,7 @@ def api_tree_remote() -> Dict[str, Any]:
         return {"error": "Set remote_url in config."}
     url = CONFIG.remote_url.rstrip("/") + "/api/tree/local"
     try:
-        r = requests.get(url, timeout=12)
+        r = requests.get(url, timeout=8)
         return r.json()
     except Exception as e:
         return {"error": f"Remote unreachable: {e}"}
@@ -753,30 +686,37 @@ def api_is_stable(relpath: str, checks: int = 3, interval_sec: float = 2.0) -> D
         return {"stable": True, "note": "not a file (dir assumed stable check skipped)"}
 
     stable = wait_for_local_file_stable(p, checks=checks, interval_sec=interval_sec)
-    return {"stable": stable, "size": p.stat().st_size}
+    return {"stable": stable, "size": int(p.stat().st_size)}
 
 
 @app.post("/api/mkdirs")
-def api_mkdirs(dirs: List[str]) -> Dict[str, Any]:
+def api_mkdirs(dir_relpath: str) -> Dict[str, Any]:
     """
-    Create directories under local_root on THIS node.
-    Input: JSON array of relpaths.
+    Create a directory (and parents) under local_root.
     """
     if not CONFIG.local_root:
         raise HTTPException(status_code=400, detail="Set local_root in config")
+
     root = Path(CONFIG.local_root).resolve()
+    rel = Path(dir_relpath)
+    if rel.is_absolute() or ".." in rel.parts:
+        raise HTTPException(status_code=400, detail="Invalid dir_relpath")
 
-    created = 0
-    for d in dirs:
-        rel = Path(d)
-        if rel.is_absolute() or ".." in rel.parts:
-            raise HTTPException(status_code=400, detail=f"Invalid dir relpath: {d}")
-        p = (root / rel).resolve()
-        _ = safe_relpath(p, root)
-        p.mkdir(parents=True, exist_ok=True)
-        created += 1
+    d = (root / rel).resolve()
+    _ = safe_relpath(d, root)
+    ensure_dir(d)
+    return {"ok": True, "created": safe_relpath(d, root)}
 
-    return {"ok": True, "created": created}
+
+@app.get("/api/files_flat")
+def api_files_flat(max_files: int = SYNC_MAX_FILES) -> Dict[str, Any]:
+    """
+    Flat listing of up to max_files files for sync planning.
+    """
+    if not CONFIG.local_root:
+        raise HTTPException(status_code=400, detail="Set local_root in config")
+    mf = min(int(max_files), SYNC_MAX_FILES)
+    return list_files_flat(Path(CONFIG.local_root), max_files=mf)
 
 
 @app.post("/api/copy")
@@ -806,6 +746,21 @@ def api_copy(req: CopyIn) -> Dict[str, Any]:
         if not data.get("stable", False):
             raise RuntimeError("Remote source file appears to be changing size (still downloading?). Try again later.")
 
+    def ensure_target_parent(job_obj: Job) -> None:
+        parent_rel = rel.parent.as_posix()
+        if parent_rel in {"", "."}:
+            return
+
+        if req.direction == "push":
+            url = CONFIG.remote_url.rstrip("/") + "/api/mkdirs"
+            job_obj.add_log(f"Ensuring remote directory exists: {parent_rel}")
+            r = requests.post(url, params={"dir_relpath": parent_rel}, timeout=30)
+            if r.status_code != 200:
+                raise RuntimeError(f"Remote mkdirs failed: {r.status_code} {r.text}")
+        else:
+            # pull → ensure local dir exists
+            ensure_dir((local_root / rel.parent).resolve())
+
     def do_copy(job_obj: Job) -> None:
         ok, why = rsync_diag(CONFIG)
         job_obj.add_log(f"rsync eligibility: {why}")
@@ -813,6 +768,8 @@ def api_copy(req: CopyIn) -> Dict[str, Any]:
         if req.direction == "push":
             if not local_path.exists():
                 raise RuntimeError("Local path not found")
+
+            ensure_target_parent(job_obj)
 
             if local_path.is_file():
                 job_obj.add_log("Checking local file stability before transfer...")
@@ -835,6 +792,7 @@ def api_copy(req: CopyIn) -> Dict[str, Any]:
 
         # pull
         ensure_remote_file_stable(job_obj)
+        ensure_target_parent(job_obj)
 
         if can_use_rsync(CONFIG):
             job_obj.add_log("Copy strategy: rsync over SSH")
@@ -906,13 +864,6 @@ async def api_upload_stream(relpath: str, request: Request):
 
 @app.post("/api/download_url")
 def api_download_url(req: UrlDownloadIn) -> Dict[str, Any]:
-    """
-    Downloads a URL onto THIS node under local_root.
-    dest_relpath:
-      - If absolute: treated as destination DIRECTORY (must remain under local_root)
-      - If relative: treated as directory under local_root
-      - If blank: defaults to local_root
-    """
     if not CONFIG.local_root:
         raise HTTPException(status_code=400, detail="Set local_root in config")
 
@@ -948,6 +899,7 @@ def api_download_url(req: UrlDownloadIn) -> Dict[str, Any]:
 
         dest = dest_dir / filename
         ensure_parent(dest)
+
         _ = safe_relpath(dest, root)
 
         job_obj.add_log(f"Downloading => {dest}")
@@ -956,6 +908,8 @@ def api_download_url(req: UrlDownloadIn) -> Dict[str, Any]:
         if hf_cmd:
             job_obj.add_log("HuggingFace CLI equivalent command:")
             job_obj.add_log(hf_cmd)
+        else:
+            job_obj.add_log("Note: URL does not look like a HuggingFace /resolve/ URL; no hf CLI command derived.")
 
         headers = {}
         if CONFIG.hf_token:
@@ -985,14 +939,6 @@ def api_download_url(req: UrlDownloadIn) -> Dict[str, Any]:
 
 @app.post("/api/hf_download")
 def api_hf_download(req: UrlDownloadIn) -> Dict[str, Any]:
-    """
-    Downloads a URL on local/remote/both.
-
-    How remote/both works:
-    - This node sends HTTP POST to remote node: /api/download_url
-      with JSON: {url, side, dest_relpath}
-    - Remote node queues its download job and returns a job_id.
-    """
     if req.side not in {"local", "remote", "both"}:
         raise HTTPException(status_code=400, detail="side must be local|remote|both")
 
@@ -1013,125 +959,146 @@ def api_hf_download(req: UrlDownloadIn) -> Dict[str, Any]:
     return {"ok": True, "results": results}
 
 
+def compute_sync_plan(
+    src_files: Dict[str, Dict[str, int]],
+    dst_files: Dict[str, Dict[str, int]],
+    mtime_strict: bool,
+    mtime_tolerance_sec: int
+) -> Tuple[List[str], Dict[str, int]]:
+    """
+    Return (to_copy_relpaths, stats)
+
+    Rules:
+      - missing on dst -> copy
+      - size differs -> copy
+      - size matches:
+          - if mtime_strict is False -> skip
+          - if mtime_strict is True:
+              - if mtime differs beyond tolerance -> copy
+              - else -> skip
+    """
+    to_copy: List[str] = []
+    same_size_skipped = 0
+    same_size_mtime_skipped = 0
+    same_size_mtime_copy = 0
+    size_diff_copy = 0
+    missing_copy = 0
+
+    for rel, sm in src_files.items():
+        dm = dst_files.get(rel)
+        if not dm:
+            to_copy.append(rel)
+            missing_copy += 1
+            continue
+
+        if int(sm.get("size", 0)) != int(dm.get("size", 0)):
+            to_copy.append(rel)
+            size_diff_copy += 1
+            continue
+
+        # sizes match:
+        if not mtime_strict:
+            same_size_skipped += 1
+            continue
+
+        if not mtime_close(int(sm.get("mtime", 0)), int(dm.get("mtime", 0)), tol_sec=mtime_tolerance_sec):
+            to_copy.append(rel)
+            same_size_mtime_copy += 1
+        else:
+            same_size_mtime_skipped += 1
+
+    stats = {
+        "missing_copy": missing_copy,
+        "size_diff_copy": size_diff_copy,
+        "same_size_skipped": same_size_skipped,
+        "same_size_mtime_copy": same_size_mtime_copy,
+        "same_size_mtime_skipped": same_size_mtime_skipped,
+        "total_source_files": len(src_files),
+        "total_dest_files": len(dst_files),
+        "planned_copies": len(to_copy),
+    }
+    return to_copy, stats
+
+
 @app.post("/api/sync")
 def api_sync(req: SyncIn) -> Dict[str, Any]:
-    """
-    Queue a sync job in a direction:
-      - push: Local -> Remote
-      - pull: Remote -> Local
-    """
     if req.direction not in {"push", "pull"}:
         raise HTTPException(status_code=400, detail="direction must be push or pull")
-    if not CONFIG.local_root or not CONFIG.remote_url or not CONFIG.remote_root:
-        raise HTTPException(status_code=400, detail="Configure local_root, remote_url, remote_root first.")
+    if not CONFIG.local_root or not CONFIG.remote_url:
+        raise HTTPException(status_code=400, detail="Configure local_root and remote_url first.")
+    if not CONFIG.remote_root:
+        # not strictly required for HTTP fallback, but required for rsync directory copies and consistent behavior
+        raise HTTPException(status_code=400, detail="Configure remote_root first (even if using HTTP fallback).")
 
-    job = create_job(kind=f"sync:{req.direction}", message="sync")
+    max_files = min(int(req.max_files), SYNC_MAX_FILES)
+    job = create_job(kind=f"sync:{req.direction}", message=f"mtime_strict={req.mtime_strict}")
 
     def do_sync(job_obj: Job) -> None:
-        job_obj.add_log(f"Starting sync ({req.direction}).")
-        job_obj.add_log(f"mtime tolerance: {req.mtime_tolerance_sec}s")
-        job_obj.add_log("Building local tree...")
-        local_tree = build_tree(Path(CONFIG.local_root), CONFIG.max_depth)
+        job_obj.add_log(f"Sync start. direction={req.direction} max_files={max_files}")
+        job_obj.add_log(f"mtime_strict={req.mtime_strict} mtime_tolerance_sec={req.mtime_tolerance_sec} dry_run={req.dry_run}")
 
-        job_obj.add_log("Fetching remote tree...")
-        remote_tree = api_tree_remote()
-        if remote_tree.get("error"):
-            raise RuntimeError(remote_tree["error"])
+        # Gather local flat list
+        local_flat = list_files_flat(Path(CONFIG.local_root), max_files=max_files)
 
-        plan = compute_sync_plan(local_tree, remote_tree, direction=req.direction, mtime_tolerance=req.mtime_tolerance_sec)
-        job_obj.add_log(f"Plan: {plan['counts']}")
+        # Gather remote flat list
+        if not CONFIG.remote_url:
+            raise RuntimeError("remote_url not set")
+        url = CONFIG.remote_url.rstrip("/") + "/api/files_flat"
+        job_obj.add_log(f"Fetching remote file list: {url}?max_files={max_files}")
+        r = requests.get(url, params={"max_files": max_files}, timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f"Remote files_flat failed: {r.status_code} {r.text}")
+        remote_flat = r.json()
 
-        # Create directories on target (via remote /api/mkdirs when pushing; local mkdir when pulling)
-        dirs_to_create: List[str] = plan["dirs_to_create"]
-        files_to_copy: List[str] = plan["files_to_copy"]
+        if local_flat.get("truncated") or remote_flat.get("truncated"):
+            job_obj.add_log("WARNING: file list truncated due to max_files cap.")
 
-        # If nothing to do
-        if not dirs_to_create and not files_to_copy:
-            job_obj.add_log("Already in sync (within tolerance).")
+        local_files = local_flat.get("files", {}) or {}
+        remote_files = remote_flat.get("files", {}) or {}
+
+        if req.direction == "push":
+            src_files, dst_files = local_files, remote_files
+        else:
+            src_files, dst_files = remote_files, local_files
+
+        to_copy, stats = compute_sync_plan(
+            src_files=src_files,
+            dst_files=dst_files,
+            mtime_strict=bool(req.mtime_strict),
+            mtime_tolerance_sec=int(req.mtime_tolerance_sec),
+        )
+
+        job_obj.add_log("Sync plan stats: " + json.dumps(stats, indent=2))
+        if req.dry_run:
+            job_obj.add_log("Dry-run mode: not enqueueing copy jobs.")
             return
 
-        # Create dirs
-        if dirs_to_create:
-            job_obj.add_log(f"Ensuring {len(dirs_to_create)} target directories exist...")
-            if req.direction == "push":
-                url = CONFIG.remote_url.rstrip("/") + "/api/mkdirs"
-                r = requests.post(url, json=dirs_to_create, timeout=60)
-                if r.status_code != 200:
-                    raise RuntimeError(f"Remote mkdirs failed: {r.status_code} {r.text}")
-                job_obj.add_log(f"Remote mkdirs: {r.json()}")
-            else:
-                # pull: create dirs locally
-                root = Path(CONFIG.local_root).resolve()
-                for d in dirs_to_create:
-                    p = (root / Path(d)).resolve()
-                    _ = safe_relpath(p, root)
-                    p.mkdir(parents=True, exist_ok=True)
+        # Enqueue copy jobs sequentially (simple + reliable)
+        total = max(1, len(to_copy))
+        for idx, rel in enumerate(to_copy, start=1):
+            job_obj.progress = (idx - 1) / total
+            job_obj.add_log(f"[{idx}/{len(to_copy)}] enqueue copy {req.direction} rel={rel}")
 
-        # Copy files
-        total = len(files_to_copy)
-        job_obj.add_log(f"Copying {total} files...")
-        for i, rel in enumerate(files_to_copy, start=1):
-            job_obj.message = rel
-            job_obj.progress = (i - 1) / max(1, total)
-            job_obj.add_log(f"[{i}/{total}] copy {rel}")
-
-            # Reuse copy endpoint (job-in-job is messy); just do inline copy logic here for speed/logging
-            local_root = Path(CONFIG.local_root).resolve()
-            remote_root = Path(CONFIG.remote_root)
-            relp = Path(rel)
-            local_path = (local_root / relp).resolve()
-
-            ok, why = rsync_diag(CONFIG)
-            job_obj.add_log(f"rsync eligibility: {why}")
+            # Ensure target dir exists
+            parent_rel = str(Path(rel).parent.as_posix())
+            if parent_rel in {"", "."}:
+                parent_rel = ""
 
             if req.direction == "push":
-                # local -> remote
-                if not local_path.exists():
-                    job_obj.add_log("WARN: local missing, skipping: " + rel)
-                    continue
-
-                if local_path.is_file():
-                    job_obj.add_log("Checking local file stability before transfer...")
-                    if not wait_for_local_file_stable(local_path, checks=2, interval_sec=1.0):
-                        raise RuntimeError(f"Local source file still changing: {rel}")
-
-                if can_use_rsync(CONFIG):
-                    job_obj.add_log("Copy strategy: rsync over SSH")
-                    ssh = build_ssh_command(CONFIG)
-                    src = str(local_path)
-                    dst = f"{CONFIG.ssh_user}@{CONFIG.ssh_host}:{str(remote_root / relp)}"
-                    run_rsync(job_obj, src, dst, ssh)
-                else:
-                    job_obj.add_log("Copy strategy: HTTP streaming fallback (rsync not eligible)")
-                    if local_path.is_dir():
-                        raise RuntimeError("HTTP push of directories not supported. Configure rsync for folders.")
-                    http_stream_copy_push(job_obj, local_path, CONFIG.remote_url, relp.as_posix())
-
+                if parent_rel:
+                    mk = requests.post(CONFIG.remote_url.rstrip("/") + "/api/mkdirs",
+                                       params={"dir_relpath": parent_rel}, timeout=30)
+                    if mk.status_code != 200:
+                        raise RuntimeError(f"Remote mkdirs failed for {parent_rel}: {mk.status_code} {mk.text}")
             else:
-                # remote -> local
-                # remote stability check
-                url = CONFIG.remote_url.rstrip("/") + "/api/is_stable"
-                job_obj.add_log(f"Checking remote stability: {url}?relpath={relp.as_posix()}")
-                r = requests.get(url, params={"relpath": relp.as_posix(), "checks": 2, "interval_sec": 1.0}, timeout=30)
-                if r.status_code != 200:
-                    raise RuntimeError(f"Remote stability check failed: {r.status_code} {r.text}")
-                data = r.json()
-                if not data.get("stable", False):
-                    raise RuntimeError(f"Remote file still changing: {rel}")
+                # pull: ensure local directory exists
+                ensure_dir((Path(CONFIG.local_root).resolve() / Path(rel).parent).resolve())
 
-                if can_use_rsync(CONFIG):
-                    job_obj.add_log("Copy strategy: rsync over SSH")
-                    ssh = build_ssh_command(CONFIG)
-                    src = f"{CONFIG.ssh_user}@{CONFIG.ssh_host}:{str(remote_root / relp)}"
-                    dst = str(local_path)
-                    ensure_parent(local_path)
-                    run_rsync(job_obj, src, dst, ssh)
-                else:
-                    job_obj.add_log("Copy strategy: HTTP streaming fallback (rsync not eligible)")
-                    http_stream_copy_pull(job_obj, CONFIG.remote_url, relp.as_posix(), local_path)
+            # Enqueue actual copy job (reuses /api/copy logic)
+            _ = api_copy(CopyIn(direction=req.direction, relpath=rel))
 
+        job_obj.add_log(f"Sync queued {len(to_copy)} copy jobs.")
         job_obj.progress = 1.0
-        job_obj.add_log("Sync complete.")
 
     JOB_QUEUE.put((job.id, do_sync))
     return {"ok": True, "job_id": job.id}
@@ -1146,7 +1113,7 @@ HTML_PAGE = r"""
 <html>
 <head>
   <meta charset="utf-8"/>
-  <title>Model Sync (v1.3.1)</title>
+  <title>Model Sync (v1.3)</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; padding: 0; }
     header { padding: 12px 16px; border-bottom: 1px solid #ddd; display:flex; gap:16px; align-items:center; justify-content:space-between; }
@@ -1157,11 +1124,19 @@ HTML_PAGE = r"""
     .row { display:flex; gap: 10px; flex-wrap: wrap; align-items:center; }
     label { font-size: 12px; color:#444; display:block; }
     input { padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; min-width: 260px; }
-    select { padding:6px 8px; border-radius:8px; border:1px solid #ccc; }
     button { padding: 7px 10px; border-radius: 8px; border: 1px solid #777; background: #fff; cursor: pointer; }
     button:hover { background:#f5f5f5; }
-    button.primary { border-color:#444; font-weight:600; }
-    .tree { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; max-height: 520px; overflow:auto; border:1px solid #eee; border-radius: 8px; padding: 8px; }
+    .tree {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      max-height: 520px;
+      overflow:auto;
+      border:1px solid #eee;
+      border-radius: 8px;
+      padding: 8px;
+      /* requested: background color for tree areas */
+      background: #f6f8ff;
+    }
     ul { list-style: none; padding-left: 16px; margin: 4px 0; }
     li { margin: 2px 0; }
     .item { padding: 2px 4px; border-radius: 6px; display:inline-block; }
@@ -1175,17 +1150,24 @@ HTML_PAGE = r"""
     .bar { height: 8px; border-radius: 10px; background: #eee; overflow:hidden; }
     .bar > div { height: 100%; background: #999; width: 0%; }
     .pill { display:inline-block; padding: 1px 6px; border:1px solid #ccc; border-radius: 999px; font-size: 11px; color:#444; }
-    .topRight { display:flex; gap:14px; align-items:center; }
+    .peer { display:flex; align-items:center; gap:8px; }
+    .dot { width:10px; height:10px; border-radius:999px; background:#bbb; display:inline-block; }
+    .dot.ok { background:#2ecc71; }
+    .dot.down { background:#e74c3c; }
+    .small { font-size: 11px; color:#666; }
+    .syncbar { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    select { padding:6px 8px; border-radius:8px; border:1px solid #ccc; }
   </style>
 </head>
 <body>
 <header>
-  <div class="row" style="gap:12px">
-    <h1>Model Sync (v1.3.1)</h1>
+  <div style="display:flex; align-items:center; gap:12px;">
+    <h1>Model Sync (v1.3)</h1>
     <span class="muted">Local tree always renders. Remote errors won’t break the page.</span>
   </div>
-  <div class="topRight">
-    <div id="peer" class="muted"></div>
+  <div class="peer">
+    <span id="peerDot" class="dot"></span>
+    <span id="peerText" class="small">Peer: (not checked)</span>
   </div>
 </header>
 
@@ -1232,7 +1214,7 @@ HTML_PAGE = r"""
         <input id="max_depth" placeholder="6"/>
       </div>
       <div style="display:flex; align-items:flex-end; gap:8px">
-        <button onclick="saveConfig()" class="primary">Save config</button>
+        <button onclick="saveConfig()">Save config</button>
         <button onclick="refreshTrees()">Refresh trees</button>
       </div>
     </div>
@@ -1240,11 +1222,11 @@ HTML_PAGE = r"""
     <div class="row" style="margin-top:12px">
       <div>
         <label>Download URL (HuggingFace or any direct URL)</label>
-        <input id="dl_url" placeholder="https://huggingface.co/.../resolve/main/model.safetensors" style="min-width:740px"/>
+        <input id="dl_url" placeholder="https://huggingface.co/.../resolve/main/model.safetensors?download=true" style="min-width:740px"/>
       </div>
       <div>
-        <label>Download directory (absolute or relative to local root)</label>
-        <input id="dl_dest" placeholder="flux/ (or /opt/ai/models/flux/)"/>
+        <label>Download directory (absolute OR relative to local root)</label>
+        <input id="dl_dest" placeholder="flux/ (or /opt/ai/comfy/models/flux/)"/>
       </div>
       <div>
         <label>Where</label>
@@ -1272,13 +1254,20 @@ HTML_PAGE = r"""
 
   <div class="grid" style="margin-top:16px">
     <div class="card">
-      <div class="row" style="justify-content:space-between">
-        <strong>Local</strong>
-        <div class="row" style="gap:8px">
-          <button class="primary" onclick="syncNow('push')">Sync Local → Remote</button>
+      <div class="syncbar" style="justify-content:space-between">
+        <div class="row" style="gap:12px;">
+          <strong>Local</strong>
           <span class="pill">drag files ➜ Remote dropzone</span>
         </div>
+        <div class="row" style="gap:10px;">
+          <label style="display:flex; align-items:center; gap:8px; margin:0;">
+            <input id="mtime_strict" type="checkbox" />
+            mtime strict (only when size matches)
+          </label>
+          <button onclick="sync('push')">Sync ➜ Remote</button>
+        </div>
       </div>
+
       <div id="tree_local" class="tree"></div>
       <div id="drop_remote" class="dropzone">
         Drop here to COPY TO REMOTE (push)
@@ -1287,13 +1276,16 @@ HTML_PAGE = r"""
     </div>
 
     <div class="card">
-      <div class="row" style="justify-content:space-between">
-        <strong>Remote</strong>
-        <div class="row" style="gap:8px">
-          <button class="primary" onclick="syncNow('pull')">Sync Remote → Local</button>
+      <div class="syncbar" style="justify-content:space-between">
+        <div class="row" style="gap:12px;">
+          <strong>Remote</strong>
           <span class="pill">drag files ➜ Local dropzone</span>
         </div>
+        <div class="row" style="gap:10px;">
+          <button onclick="sync('pull')">Sync ➜ Local</button>
+        </div>
       </div>
+
       <div id="tree_remote" class="tree"></div>
       <div id="drop_local" class="dropzone">
         Drop here to COPY TO LOCAL (pull)
@@ -1480,13 +1472,19 @@ async function downloadUrl(){
   }
 }
 
-async function syncNow(direction){
-  // direction: push or pull
-  const res = await apiPost("/api/sync", {direction: direction, mtime_tolerance_sec: 2});
+async function sync(direction){
+  const mtimeStrict = !!el("mtime_strict").checked;
+  const res = await apiPost("/api/sync", {
+    direction,
+    mtime_strict: mtimeStrict,
+    mtime_tolerance_sec: 2,
+    max_files: 500,
+    dry_run: false
+  });
   if (res.status !== 200){
     alert("Sync failed: " + JSON.stringify(res.json));
   } else {
-    setStatus("Started sync job: " + res.json.job_id);
+    setStatus("Sync started (job): " + res.json.job_id);
     setTimeout(()=>setStatus(""), 1500);
   }
 }
@@ -1517,9 +1515,19 @@ async function refreshJobs(){
 }
 
 async function refreshPeer(){
-  const ps = await apiGet("/api/peer_status");
-  const t = ps.last_check ? new Date(ps.last_check * 1000).toLocaleTimeString() : "never";
-  el("peer").innerText = `Peer: ${ps.ok ? "OK" : "DOWN"} (${ps.detail}) @ ${t}`;
+  try {
+    const ps = await apiGet("/api/peer_status");
+    const dot = el("peerDot");
+    dot.classList.remove("ok","down");
+    dot.classList.add(ps.ok ? "ok" : "down");
+    const t = ps.last_check ? new Date(ps.last_check * 1000).toLocaleTimeString() : "never";
+    el("peerText").innerText = `Peer: ${ps.ok ? "OK" : "DOWN"} (${ps.detail}) @ ${t}`;
+  } catch (e) {
+    const dot = el("peerDot");
+    dot.classList.remove("ok");
+    dot.classList.add("down");
+    el("peerText").innerText = "Peer: (error reading status)";
+  }
 }
 
 (async function init(){
