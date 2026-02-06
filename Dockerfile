@@ -1,21 +1,25 @@
 FROM python:3.12-slim
 
-# System tools: rsync + ssh client (recommended transfer path)
+# System deps for rsync + ssh
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    rsync openssh-client ca-certificates \
+    rsync \
+    openssh-client \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Create non-root user
+ARG UID=1000
+ARG GID=1000
+RUN groupadd -g ${GID} app && useradd -m -u ${UID} -g ${GID} -s /bin/bash app
+
 WORKDIR /app
-
-# Install Python deps first (better caching)
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy app
 COPY sync-models.py /app/sync-models.py
 
-# Default port (can be overridden by docker-compose)
-EXPOSE 9090
+# Python deps (pin if you want)
+RUN pip install --no-cache-dir fastapi uvicorn requests pydantic
 
-# Run the server
-CMD ["python", "sync-models.py", "--host", "0.0.0.0", "--port", "9090", "--peer-poll-seconds", "10"]
+USER app
+ENV HOME=/home/app
+
+EXPOSE 9090
+CMD ["python", "/app/sync-models.py", "--host", "0.0.0.0", "--port", "9090", "--peer-poll-seconds", "10"]

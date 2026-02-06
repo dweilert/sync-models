@@ -17,6 +17,7 @@ Features:
   - Sync compares SIZE first
   - If sizes match, it only uses MTIME when "mtime strict" toggle is enabled
   - MTIME uses a tolerance (default 2s) to avoid filesystem timestamp quirks
+- UI checkbox to suppress noisy polling request logs in server console
 
 Start:
   python model_sync_app.py --host 0.0.0.0 --port 9090 --peer-poll-seconds 10
@@ -43,8 +44,30 @@ from typing import Dict, Any, List, Tuple, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
+from fastapi import Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager
+
+import logging
+
+# =============================================================================
+# Access log filter
+# =============================================================================
+
+class AccessLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not CONFIG.suppress_poll_logs:
+            return True
+
+        msg = record.getMessage()
+        noisy = (
+            "GET /api/health" in msg or
+            "GET /api/jobs" in msg or
+            "GET /api/peer_status" in msg
+        )
+        return not noisy
+
 
 # =============================================================================
 # Helpers
@@ -261,6 +284,7 @@ class AppConfig:
     prefer_rsync: bool = True
     max_depth: int = 6
     hf_token: str = ""
+    suppress_poll_logs: bool = True
 
     def to_json(self) -> Dict[str, Any]:
         return asdict(self)
@@ -279,6 +303,8 @@ class AppConfig:
 
 
 CONFIG = AppConfig.load()
+logging.getLogger("uvicorn.access").addFilter(AccessLogFilter())
+
 
 # =============================================================================
 # Jobs
@@ -542,6 +568,7 @@ class ConfigIn(BaseModel):
     prefer_rsync: bool = True
     max_depth: int = 6
     hf_token: str = ""
+    suppress_poll_logs: bool = True
 
 
 class CopyIn(BaseModel):
@@ -575,13 +602,29 @@ class PeerStatus:
 
 
 # =============================================================================
+# Lifespan handler
+# ============================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # startup
+    t = threading.Thread(target=peer_poll_loop, daemon=True)
+    t.start()
+
+    yield  # application runs here
+
+    # shutdown (optional cleanup)
+    # nothing required right now
+
+
+# =============================================================================
 # FastAPI App
 # =============================================================================
 
-app = FastAPI()
+#app = FastAPI()
+app = FastAPI(lifespan=lifespan)
+
 app.state.peer_poll_seconds = 10
 app.state.peer_status = PeerStatus()
-
 
 def peer_poll_loop():
     while True:
@@ -608,12 +651,6 @@ def peer_poll_loop():
             ps.detail = f"{e}"
 
 
-@app.on_event("startup")
-def _startup():
-    t = threading.Thread(target=peer_poll_loop, daemon=True)
-    t.start()
-
-
 @app.get("/", response_class=HTMLResponse)
 def ui_index() -> str:
     return HTML_PAGE
@@ -637,9 +674,10 @@ def api_get_config() -> Dict[str, Any]:
 @app.post("/api/config")
 def api_set_config(cfg: ConfigIn) -> Dict[str, Any]:
     global CONFIG
-    CONFIG = AppConfig(**cfg.dict())
+    CONFIG = AppConfig(**cfg.model_dump())
     CONFIG.save()
     return {"ok": True, "config": CONFIG.to_json()}
+
 
 
 @app.get("/api/tree/local")
@@ -1186,9 +1224,22 @@ HTML_PAGE = r"""
         <label>Remote root</label>
         <input id="remote_root" placeholder="/opt/ai/models"/>
       </div>
+    </div>
+
+    <div class="row">
+      <div style="min-width:280px">
+        <label>mTime strich check</label>
+        <input id="mtime_strict" type="checkbox" style="min-width:auto"/>
+      </div>
+
       <div style="min-width:280px">
         <label>Prefer rsync</label>
         <input id="prefer_rsync" type="checkbox" style="min-width:auto"/>
+      </div>
+
+      <div style="min-width:280px">
+        <label>Suppress poll logs (peer/jobs)</label>
+        <input id="suppress_poll_logs" type="checkbox" style="min-width:auto"/>
       </div>
     </div>
 
@@ -1260,10 +1311,6 @@ HTML_PAGE = r"""
           <span class="pill">drag files ➜ Remote dropzone</span>
         </div>
         <div class="row" style="gap:10px;">
-          <label style="display:flex; align-items:center; gap:8px; margin:0;">
-            <input id="mtime_strict" type="checkbox" />
-            mtime strict (only when size matches)
-          </label>
           <button onclick="sync('push')">Sync ➜ Remote</button>
         </div>
       </div>
@@ -1385,6 +1432,8 @@ async function loadConfig(){
   el("prefer_rsync").checked = !!cfg.prefer_rsync;
   el("max_depth").value = cfg.max_depth || 6;
   el("hf_token").value = cfg.hf_token || "";
+  el("suppress_poll_logs").checked = (cfg.suppress_poll_logs !== undefined) ? !!cfg.suppress_poll_logs : true;
+
 }
 
 async function saveConfig(){
@@ -1399,6 +1448,8 @@ async function saveConfig(){
     prefer_rsync: el("prefer_rsync").checked,
     max_depth: parseInt(el("max_depth").value.trim() || "6"),
     hf_token: el("hf_token").value.trim(),
+    suppress_poll_logs: el("suppress_poll_logs").checked,
+
   };
   const res = await apiPost("/api/config", body);
   if (res.status !== 200){
@@ -1558,7 +1609,9 @@ def main():
     app.state.peer_poll_seconds = max(1, int(args.peer_poll_seconds))
 
     import uvicorn
-    uvicorn.run(app, host=args.host, port=args.port)
+    #uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host=args.host, port=args.port, access_log=True)
+
 
 
 if __name__ == "__main__":

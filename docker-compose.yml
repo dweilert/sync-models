@@ -2,31 +2,22 @@ services:
   model-sync:
     build:
       context: .
-      dockerfile: Dockerfile
+      args:
+        UID: 1000
+        GID: 1000
     container_name: model-sync
-    restart: unless-stopped
-
-    # Host port -> container port
     ports:
-      - "${MODEL_SYNC_PORT:-9090}:9090"
-
-    # Persist config and mount models + ssh keys
-    volumes:
-      - ${MODEL_SYNC_MODELS_DIR:-./models}:/models
-      - model_sync_config:/config
-      - ${MODEL_SYNC_SSH_DIR:-~/.ssh}:/ssh:ro
-
+      - "9090:9090"
+    user: "1000:1000"
     environment:
-      # Ensure ~/.model_sync_config.json persists
-      - HOME=/config
-      - TZ=${TZ:-America/Chicago}
+      - HOME=/home/app
+    volumes:
+      # Persist config in /home/app/.model_sync_config.json on the host
+      - ./data:/home/app
 
-    # Explicit run command so poll interval is configurable
-    command: >
-      python sync-models.py
-      --host 0.0.0.0
-      --port 9090
-      --peer-poll-seconds ${MODEL_SYNC_PEER_POLL_SECONDS:-10}
+      # Your models on the host -> /models in the container
+      - /opt/ai/models:/models
 
-volumes:
-  model_sync_config:
+      # SSH keys/config for rsync/ssh
+      # NOTE: needs to be writable if ssh will write known_hosts.
+      - ${HOME}/.ssh:/home/app/.ssh
