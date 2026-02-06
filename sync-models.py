@@ -14,19 +14,12 @@ Features:
 - Job status + progress
 - Peer check loop (health ping) at configurable interval via --peer-poll-seconds
 - Before any copy: verify SOURCE file is stable (size not changing)
-
-Start:
-  python model_sync_app.py --host 0.0.0.0 --port 9090 --peer-poll-seconds 10
-
-Open:
-  http://<machine-ip>:9090
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import queue
 import re
 import shutil
@@ -36,11 +29,11 @@ import time
 import uuid
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 # =============================================================================
@@ -88,6 +81,170 @@ def wait_for_local_file_stable(path: Path, checks: int = 3, interval_sec: float 
     return path.stat().st_size == last
 
 
+def parse_rsync_version(text: str) -> Optional[Tuple[int, int, int]]:
+    """
+    Parse output of `rsync --version` and return (major, minor, patch) if possible.
+    Example first line: "rsync  version 3.2.7  protocol version 31"
+    """
+    m = re.search(r"rsync\s+version\s+(\d+)\.(\d+)\.(\d+)", text)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def get_rsync_version() -> Optional[Tuple[int, int, int]]:
+    rsync_path = shutil.which("rsync")
+    if not rsync_path:
+        return None
+    try:
+        r = subprocess.run([rsync_path, "--version"], capture_output=True, text=True, check=False)
+        out = (r.stdout or "") + "\n" + (r.stderr or "")
+        return parse_rsync_version(out)
+    except Exception:
+        return None
+
+
+def supports_info_progress2(ver: Optional[Tuple[int, int, int]]) -> bool:
+    # progress2 came in rsync 3.1.0
+    if not ver:
+        return False
+    return ver >= (3, 1, 0)
+
+
+def human_shell_quote(s: str) -> str:
+    """
+    Minimal quoting for logs / copy-paste convenience.
+    """
+    if re.search(r"[^\w@%+=:,./-]", s):
+        return "'" + s.replace("'", "'\"'\"'") + "'"
+    return s
+
+
+def parse_hf_resolve_url(url: str) -> Optional[Tuple[str, str, str]]:
+    """
+    Parse Hugging Face resolve URL into (repo_id, revision, file_path).
+
+    Example:
+      https://huggingface.co/owner/repo/resolve/main/path/to/file.safetensors?download=true
+    -> repo_id="owner/repo", revision="main", file_path="path/to/file.safetensors"
+
+    Returns None if not a recognizable HF resolve URL.
+    """
+    # strip query string
+    base = url.split("?", 1)[0].rstrip("/")
+    m = re.match(r"^https?://huggingface\.co/([^/]+/[^/]+)/resolve/([^/]+)/(.*)$", base)
+    if not m:
+        return None
+    repo_id, revision, file_path = m.group(1), m.group(2), m.group(3)
+    if not repo_id or not revision or not file_path:
+        return None
+    return repo_id, revision, file_path
+
+
+# def build_hf_cli_command(url: str, dest: Path, token: str = "") -> Optional[str]:
+#     """
+#     Build a copy/paste-able huggingface-cli command for the provided URL, if possible.
+#     Returns None if URL isn't an HF resolve URL.
+
+#     Notes:
+#     - We use `--local-dir` so the user can control where the file lands.
+#     - We add --revision when present.
+#     - Token handling: either export HF_TOKEN or pass --token (both are acceptable).
+#     """
+#     parsed = parse_hf_resolve_url(url)
+#     if not parsed:
+#         return None
+
+#     repo_id, revision, file_path = parsed
+#     local_dir = dest.parent
+
+#     # Many users prefer env var; but we can also show --token explicitly when configured.
+#     token_part = ""
+#     if token:
+#         # Either of these works; pick one. I’ll show explicit --token for clarity.
+#         token_part = f" --token {human_shell_quote(token)}"
+
+#     cmd = (
+#         "huggingface-cli download "
+#         f"{human_shell_quote(repo_id)} "
+#         f"{human_shell_quote(file_path)} "
+#         f"--revision {human_shell_quote(revision)} "
+#         f"--local-dir {human_shell_quote(str(local_dir))} "
+#         "--local-dir-use-symlinks False"
+#         f"{token_part}"
+#     )
+#     return cmd
+
+
+# def build_hf_cli_command(url: str, dest: Path, token: str = "") -> Optional[str]:
+#     """
+#     Build a copy/paste-able modern `hf download` command
+#     for a Hugging Face resolve URL.
+#     """
+#     parsed = parse_hf_resolve_url(url)
+#     if not parsed:
+#         return None
+
+#     repo_id, revision, file_path = parsed
+#     local_dir = dest.parent
+
+#     token_part = ""
+#     if token:
+#         token_part = f" --token {human_shell_quote(token)}"
+
+#     cmd = (
+#         "hf download "
+#         f"{human_shell_quote(repo_id)} "
+#         f"{human_shell_quote(file_path)} "
+#         f"--revision {human_shell_quote(revision)} "
+#         f"--local-dir {human_shell_quote(str(local_dir))} "
+#         "--local-dir-use-symlinks False"
+#         f"{token_part}"
+#     )
+#     return cmd
+
+def build_hf_cli_command(url: str, dest: Path, token: str = "") -> Optional[str]:
+    """
+    Build a copy/paste-able modern `hf download` command
+    for a Hugging Face resolve URL.
+
+    - Uses modern `hf` CLI (not huggingface-cli)
+    - Uses HF_TOKEN env var for auth (from UI)
+    - Never emits deprecated flags
+    - Ensures --local-dir is a directory (not a filename)
+    """
+    parsed = parse_hf_resolve_url(url)
+    if not parsed:
+        return None
+
+    repo_id, revision, file_path = parsed
+
+    # hf expects a DIRECTORY for --local-dir
+    local_dir = dest.parent
+
+    # Auth via environment variable (most compatible)
+    env_prefix = ""
+    if token:
+        env_prefix = f"HF_TOKEN={human_shell_quote(token)} "
+
+    # Only include revision when it is meaningful
+    rev_part = ""
+    if revision and revision not in {"main", "master"}:
+        rev_part = f"--revision {human_shell_quote(revision)} "
+
+    cmd = (
+        f"{env_prefix}"
+        "hf download "
+        f"{human_shell_quote(repo_id)} "
+        f"{human_shell_quote(file_path)} "
+        f"{rev_part}"
+        f"--local-dir {human_shell_quote(str(local_dir))}"
+    )
+
+
+    return cmd
+
+
 # =============================================================================
 # Config
 # =============================================================================
@@ -95,17 +252,15 @@ def wait_for_local_file_stable(path: Path, checks: int = 3, interval_sec: float 
 @dataclass
 class AppConfig:
     local_root: str = ""
-    remote_url: str = ""          # e.g. http://192.168.1.50:9090
-    remote_root: str = ""         # remote models directory root (for rsync path building)
-    # rsync/ssh config (recommended)
-    ssh_host: str = ""            # e.g. 192.168.1.50
+    remote_url: str = ""
+    remote_root: str = ""
+    ssh_host: str = ""
     ssh_port: int = 22
     ssh_user: str = ""
-    ssh_key_path: str = ""        # optional, e.g. ~/.ssh/id_ed25519
+    ssh_key_path: str = ""
     prefer_rsync: bool = True
     max_depth: int = 6
-    hf_token: str = ""  # HuggingFace token (optional)
-
+    hf_token: str = ""
 
     def to_json(self) -> Dict[str, Any]:
         return asdict(self)
@@ -134,9 +289,9 @@ class Job:
     id: str
     kind: str
     created: float
-    status: str            # queued, running, done, error
+    status: str
     message: str = ""
-    progress: float = 0.0  # 0..1
+    progress: float = 0.0
     bytes_done: int = 0
     bytes_total: int = 0
     log: List[str] = None
@@ -190,14 +345,34 @@ WORKER_THREAD.start()
 # Transfer logic (rsync + HTTP fallback)
 # =============================================================================
 
-def can_use_rsync(cfg: AppConfig) -> bool:
+def rsync_diag(cfg: AppConfig) -> Tuple[bool, str]:
+    reasons = []
     if not cfg.prefer_rsync:
-        return False
-    if not (cfg.ssh_host and cfg.ssh_user and cfg.remote_root):
-        return False
-    if cfg.ssh_key_path and not Path(cfg.ssh_key_path).expanduser().exists():
-        return False
-    return shutil.which("rsync") is not None
+        reasons.append("prefer_rsync is False")
+    if not cfg.ssh_host:
+        reasons.append("ssh_host not set")
+    if not cfg.ssh_user:
+        reasons.append("ssh_user not set")
+    if not cfg.remote_root:
+        reasons.append("remote_root not set")
+
+    if cfg.ssh_key_path:
+        keyp = Path(cfg.ssh_key_path).expanduser()
+        if not keyp.exists():
+            reasons.append(f"ssh_key_path does not exist: {keyp}")
+
+    rsync_path = shutil.which("rsync")
+    if rsync_path is None:
+        reasons.append("rsync not found in PATH")
+
+    if reasons:
+        return False, "; ".join(reasons)
+    return True, f"OK (rsync={rsync_path})"
+
+
+def can_use_rsync(cfg: AppConfig) -> bool:
+    ok, _ = rsync_diag(cfg)
+    return ok
 
 
 def build_ssh_command(cfg: AppConfig) -> str:
@@ -209,12 +384,31 @@ def build_ssh_command(cfg: AppConfig) -> str:
 
 
 def run_rsync(job: Job, src: str, dst: str, ssh: str) -> None:
+    """
+    Runs rsync and attempts to track progress.
+
+    macOS often ships rsync 2.6.9 which DOES NOT support: --info=progress2
+    So we pick flags based on detected rsync version.
+    """
+    rsync_path = shutil.which("rsync") or "rsync"
+    ver = get_rsync_version()
+    job.add_log(f"Detected rsync version: {ver if ver else 'unknown'} (path={rsync_path})")
+
+    progress_args: List[str]
+    if supports_info_progress2(ver):
+        progress_args = ["--info=progress2"]
+        job.add_log("rsync progress mode: --info=progress2")
+    else:
+        # Compatible fallback for older rsync (e.g., macOS 2.6.9)
+        progress_args = ["--progress"]
+        job.add_log("rsync progress mode: --progress (fallback; --info=progress2 not supported)")
+
     cmd = [
-        "rsync",
+        rsync_path,
         "-a",
         "--partial",
         "--inplace",
-        "--info=progress2",
+        *progress_args,
         "--no-inc-recursive",
         "-e",
         ssh,
@@ -222,6 +416,7 @@ def run_rsync(job: Job, src: str, dst: str, ssh: str) -> None:
         dst,
     ]
     job.add_log(" ".join(cmd))
+
     p = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -230,27 +425,40 @@ def run_rsync(job: Job, src: str, dst: str, ssh: str) -> None:
         bufsize=1,
         universal_newlines=True,
     )
+
+    # Parse percent lines where possible. (Works well for progress2; partially for --progress)
     last_percent = 0
+    percent_re = re.compile(r"(\d+)%")
+    bytes_re = re.compile(r"(\d+(?:\.\d+)?)([KMG]?B)\s+")
+
     for line in p.stdout or []:
         line = line.rstrip()
         if line:
             job.add_log(line)
-        m = re.search(r"(\d+)%", line)
+
+        m = percent_re.search(line)
         if m:
-            percent = int(m.group(1))
-            if percent >= last_percent:
-                last_percent = percent
-                job.progress = percent / 100.0
+            try:
+                percent = int(m.group(1))
+                if percent >= last_percent:
+                    last_percent = percent
+                    job.progress = percent / 100.0
+            except Exception:
+                pass
+
+        # Optional: try to infer bytes_done/total for older rsync lines (best-effort)
+        # This is messy across versions; keep minimal.
+        # If you want, we can tighten this for your exact rsync output format.
+        # (Leaving it best-effort because accuracy varies a lot.)
+        _ = bytes_re.search(line)
+
     rc = p.wait()
+    job.add_log(f"rsync exit code: {rc}")
     if rc != 0:
         raise RuntimeError(f"rsync failed (exit {rc})")
 
 
 def http_stream_copy_push(job: Job, local_file: Path, remote_url: str, remote_rel: str) -> None:
-    """
-    Push local file to remote via HTTP streaming.
-    Remote endpoint: POST /api/upload_stream?relpath=...
-    """
     url = remote_url.rstrip("/") + "/api/upload_stream"
     size = local_file.stat().st_size
     job.bytes_total = size
@@ -274,10 +482,6 @@ def http_stream_copy_push(job: Job, local_file: Path, remote_url: str, remote_re
 
 
 def http_stream_copy_pull(job: Job, remote_url: str, remote_rel: str, local_file: Path) -> None:
-    """
-    Pull remote file via HTTP streaming.
-    Remote endpoint: GET /api/download_stream?relpath=...
-    """
     url = remote_url.rstrip("/") + "/api/download_stream"
     job.add_log(f"HTTP PULL <= {url}?relpath={remote_rel}")
     ensure_parent(local_file)
@@ -346,8 +550,7 @@ class ConfigIn(BaseModel):
     ssh_key_path: str = ""
     prefer_rsync: bool = True
     max_depth: int = 6
-    hf_token: str = "" 
-
+    hf_token: str = ""
 
 
 class CopyIn(BaseModel):
@@ -382,10 +585,6 @@ app.state.peer_status = PeerStatus()
 
 
 def peer_poll_loop():
-    """
-    Periodically check if remote is alive.
-    This does NOT sync automatically; it just validates connectivity and improves UI feedback.
-    """
     while True:
         time.sleep(max(1, int(app.state.peer_poll_seconds)))
         ps: PeerStatus = app.state.peer_status
@@ -426,12 +625,6 @@ def api_health() -> Dict[str, Any]:
     return {"ok": True, "time": int(now_ts())}
 
 
-@app.get("/api/peer_status")
-def api_peer_status() -> Dict[str, Any]:
-    ps: PeerStatus = app.state.peer_status
-    return asdict(ps)
-
-
 @app.get("/api/config")
 def api_get_config() -> Dict[str, Any]:
     return CONFIG.to_json()
@@ -454,10 +647,6 @@ def api_tree_local() -> Dict[str, Any]:
 
 @app.get("/api/tree/remote")
 def api_tree_remote() -> Dict[str, Any]:
-    """
-    Proxy remote tree through this server to avoid CORS issues.
-    Always returns JSON, with {error: "..."} on failure.
-    """
     if not CONFIG.remote_url:
         return {"error": "Set remote_url in config."}
     url = CONFIG.remote_url.rstrip("/") + "/api/tree/local"
@@ -474,41 +663,8 @@ def api_jobs() -> Dict[str, Any]:
     return {"jobs": [asdict(j) for j in items[:50]]}
 
 
-@app.get("/api/stat")
-def api_stat(relpath: str) -> Dict[str, Any]:
-    """
-    Returns file/dir stat on this node (used for remote stability checks).
-    """
-    if not CONFIG.local_root:
-        raise HTTPException(status_code=400, detail="Set local_root in config")
-
-    root = Path(CONFIG.local_root).resolve()
-    rel = Path(relpath)
-    if rel.is_absolute() or ".." in rel.parts:
-        raise HTTPException(status_code=400, detail="Invalid relpath")
-
-    p = (root / rel).resolve()
-    _ = safe_relpath(p, root)
-
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="Not found")
-
-    st = p.stat()
-    return {
-        "exists": True,
-        "is_file": p.is_file(),
-        "is_dir": p.is_dir(),
-        "size": st.st_size,
-        "mtime": int(st.st_mtime),
-    }
-
-
 @app.get("/api/is_stable")
 def api_is_stable(relpath: str, checks: int = 3, interval_sec: float = 2.0) -> Dict[str, Any]:
-    """
-    Remote-callable stability check for THIS node.
-    Only meaningful for files.
-    """
     if not CONFIG.local_root:
         raise HTTPException(status_code=400, detail="Set local_root in config")
 
@@ -544,13 +700,9 @@ def api_copy(req: CopyIn) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Invalid relpath")
 
     local_path = (local_root / rel).resolve()
-
     job = create_job(kind=f"copy:{req.direction}", message=req.relpath)
 
     def ensure_remote_file_stable(job_obj: Job) -> None:
-        """
-        Ask remote node if its source file is stable before we pull from it.
-        """
         url = CONFIG.remote_url.rstrip("/") + "/api/is_stable"
         job_obj.add_log(f"Checking remote stability: {url}?relpath={rel.as_posix()}")
         r = requests.get(url, params={"relpath": rel.as_posix(), "checks": 3, "interval_sec": 2.0}, timeout=30)
@@ -561,45 +713,46 @@ def api_copy(req: CopyIn) -> Dict[str, Any]:
             raise RuntimeError("Remote source file appears to be changing size (still downloading?). Try again later.")
 
     def do_copy(job_obj: Job) -> None:
-        # PUSH (local -> remote)
+        ok, why = rsync_diag(CONFIG)
+        job_obj.add_log(f"rsync eligibility: {why}")
+
         if req.direction == "push":
             if not local_path.exists():
                 raise RuntimeError("Local path not found")
 
-            # If pushing a file, ensure it's stable first
             if local_path.is_file():
                 job_obj.add_log("Checking local file stability before transfer...")
                 if not wait_for_local_file_stable(local_path, checks=3, interval_sec=2.0):
                     raise RuntimeError("Local source file appears to be changing size (still downloading?). Try again later.")
 
             if can_use_rsync(CONFIG):
+                job_obj.add_log("Copy strategy: rsync over SSH")
                 ssh = build_ssh_command(CONFIG)
                 src = str(local_path) + ("/" if local_path.is_dir() else "")
                 dst = f"{CONFIG.ssh_user}@{CONFIG.ssh_host}:{str(remote_root / rel)}"
                 run_rsync(job_obj, src, dst, ssh)
                 return
 
-            # HTTP push fallback: files only
+            job_obj.add_log("Copy strategy: HTTP streaming fallback (rsync not eligible)")
             if local_path.is_dir():
                 raise RuntimeError("HTTP push of directories not supported. Configure rsync for folders.")
             http_stream_copy_push(job_obj, local_path, CONFIG.remote_url, rel.as_posix())
             return
 
-        # PULL (remote -> local)
-        # If pulling a file, ensure remote says it is stable first
+        # pull
         ensure_remote_file_stable(job_obj)
 
         if can_use_rsync(CONFIG):
+            job_obj.add_log("Copy strategy: rsync over SSH")
             ssh = build_ssh_command(CONFIG)
             src = f"{CONFIG.ssh_user}@{CONFIG.ssh_host}:{str(remote_root / rel)}"
             dst = str(local_path)
             run_rsync(job_obj, src, dst, ssh)
             return
 
-        # HTTP pull fallback: files only
+        job_obj.add_log("Copy strategy: HTTP streaming fallback (rsync not eligible)")
         http_stream_copy_pull(job_obj, CONFIG.remote_url, rel.as_posix(), local_path)
 
-        # After pull, optionally check local stability (cheap sanity)
         if local_path.exists() and local_path.is_file():
             job_obj.add_log("Post-transfer local stability check...")
             _ = wait_for_local_file_stable(local_path, checks=2, interval_sec=1.0)
@@ -659,9 +812,6 @@ async def api_upload_stream(relpath: str, request: Request):
 
 @app.post("/api/download_url")
 def api_download_url(req: UrlDownloadIn) -> Dict[str, Any]:
-    """
-    Downloads a URL onto THIS node under local_root.
-    """
     if not CONFIG.local_root:
         raise HTTPException(status_code=400, detail="Set local_root in config")
 
@@ -670,20 +820,64 @@ def api_download_url(req: UrlDownloadIn) -> Dict[str, Any]:
     def do_dl(job_obj: Job) -> None:
         root = Path(CONFIG.local_root).resolve()
 
-        if req.dest_relpath:
-            rel = Path(req.dest_relpath)
-            if rel.is_absolute() or ".." in rel.parts:
-                raise RuntimeError("Invalid dest_relpath")
-            dest = (root / rel).resolve()
+        # if req.dest_relpath:
+        #     rel = Path(req.dest_relpath)
+        #     if rel.is_absolute() or ".." in rel.parts:
+        #         raise RuntimeError("Invalid dest_relpath")
+        #     dest = (root / rel).resolve()
+        # else:
+        #     name = req.url.rstrip("/").split("/")[-1].split("?")[0] or f"download_{int(time.time())}"
+        #     dest = (root / name).resolve()
+
+        parsed = parse_hf_resolve_url(req.url)
+
+        # Determine filename
+        if parsed:
+            _, _, file_path = parsed
+            filename = Path(file_path).name
         else:
-            name = req.url.rstrip("/").split("/")[-1].split("?")[0] or f"download_{int(time.time())}"
-            dest = (root / name).resolve()
+            filename = req.url.rstrip("/").split("/")[-1].split("?")[0]
+            if not filename:
+                filename = f"download_{int(time.time())}"
+
+        # Determine destination directory
+        if req.dest_relpath:
+            dest_dir = Path(req.dest_relpath).expanduser()
+
+            # Absolute path → use directly
+            if dest_dir.is_absolute():
+                dest_dir = dest_dir.resolve()
+            else:
+                # Relative path → relative to local_root
+                dest_dir = (root / dest_dir).resolve()
+        else:
+            # Default: drop into local_root
+            dest_dir = root
+
+        # Safety check: ensure destination is inside local_root
+        dest_dir = dest_dir.resolve()
+        if not str(dest_dir).startswith(str(root)):
+            raise RuntimeError("Destination directory escapes local_root")
+
+        dest = dest_dir / filename
+        ensure_parent(dest)
+
+
 
         _ = safe_relpath(dest, root)
         ensure_parent(dest)
 
         job_obj.add_log(f"Downloading => {dest}")
-        #with requests.get(req.url, stream=True, timeout=3600) as r:
+
+        # If this is a Hugging Face resolve URL, show an equivalent huggingface-cli command
+        hf_cmd = build_hf_cli_command(req.url, dest, token=CONFIG.hf_token)
+        if hf_cmd:
+            job_obj.add_log("HuggingFace CLI equivalent command:")
+            job_obj.add_log(hf_cmd)
+        else:
+            job_obj.add_log("Note: URL does not look like a HuggingFace /resolve/ URL; no hf CLI command derived.")
+
+
         headers = {}
         if CONFIG.hf_token:
             headers["Authorization"] = f"Bearer {CONFIG.hf_token}"
@@ -702,7 +896,6 @@ def api_download_url(req: UrlDownloadIn) -> Dict[str, Any]:
                     job_obj.bytes_done = done
                     job_obj.progress = done / max(1, total) if total else 0.0
 
-        # Ensure file is stable after download completes
         job_obj.add_log("Verifying downloaded file is stable...")
         if not wait_for_local_file_stable(dest, checks=3, interval_sec=1.0):
             raise RuntimeError("Downloaded file still changing size after download finished (unexpected).")
@@ -713,14 +906,6 @@ def api_download_url(req: UrlDownloadIn) -> Dict[str, Any]:
 
 @app.post("/api/hf_download")
 def api_hf_download(req: UrlDownloadIn) -> Dict[str, Any]:
-    """
-    Downloads a URL on local/remote/both.
-
-    How remote download is done:
-    - This node sends HTTP POST to remote node: /api/download_url
-      with JSON: {url, side, dest_relpath}
-    - Remote node queues a local download job and returns a job_id.
-    """
     if req.side not in {"local", "remote", "both"}:
         raise HTTPException(status_code=400, detail="side must be local|remote|both")
 
@@ -839,7 +1024,7 @@ HTML_PAGE = r"""
         <input id="dl_url" placeholder="https://huggingface.co/.../resolve/main/model.safetensors?download=true" style="min-width:740px"/>
       </div>
       <div>
-        <label>Download destination (optional relpath under root)</label>
+        <label>Download directory (absolute or relative to local root) Example: .../z_image_turbo_bf16.safetensors</label>
         <input id="dl_dest" placeholder="flux/model.safetensors"/>
       </div>
       <div>
@@ -859,7 +1044,6 @@ HTML_PAGE = r"""
         <label>HuggingFace Token (optional)</label>
         <input id="hf_token" placeholder="hf_..." style="min-width:420px"/>
       </div>
-    
     </div>
 
     <div class="row" style="margin-top:10px; justify-content:space-between">
@@ -1012,7 +1196,6 @@ async function saveConfig(){
 async function refreshTrees(){
   setStatus("Refreshing trees...");
 
-  // Always render local first; remote failure must not break local.
   try {
     const local = await apiGet("/api/tree/local");
     renderTree(el("tree_local"), local);
@@ -1089,7 +1272,7 @@ async function refreshJobs(){
         <div><span class="pill">${j.status}</span> <span class="muted">${pct}% ${bytes}</span></div>
       </div>
       <div class="bar"><div style="width:${pct}%"></div></div>
-      <details style="margin-top:6px">
+      <details open style="margin-top:6px">
         <summary class="muted">log</summary>
         <pre style="white-space:pre-wrap; font-size:11px; margin:6px 0 0 0">${(j.log || []).slice(-30).join("\n")}</pre>
       </details>
@@ -1098,19 +1281,12 @@ async function refreshJobs(){
   });
 }
 
-async function refreshPeer(){
-  const ps = await apiGet("/api/peer_status");
-  const t = ps.last_check ? new Date(ps.last_check * 1000).toLocaleTimeString() : "never";
-  el("peer").innerText = `Peer check: ${ps.ok ? "OK" : "DOWN"} (${ps.detail}) @ ${t}`;
-}
-
 (async function init(){
   await loadConfig();
   await refreshTrees();
   setupDropzone(el("drop_remote"), "push");
   setupDropzone(el("drop_local"), "pull");
   setInterval(refreshJobs, 1000);
-  setInterval(refreshPeer, 2000);
 })();
 </script>
 </body>
