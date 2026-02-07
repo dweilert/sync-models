@@ -68,6 +68,12 @@ class AccessLogFilter(logging.Filter):
         )
         return not noisy
 
+# =============================================================================
+# HuggingFace download directory (fixed)
+# =============================================================================
+
+HF_DOWNLOAD_DIR_NAME = "hfdownload"
+
 
 # =============================================================================
 # Helpers
@@ -921,24 +927,21 @@ def api_download_url(req: UrlDownloadIn) -> Dict[str, Any]:
             if not filename:
                 filename = f"download_{int(time.time())}"
 
-        # Determine destination directory
-        if req.dest_relpath:
-            dest_dir = Path(req.dest_relpath).expanduser()
-            if dest_dir.is_absolute():
-                dest_dir = dest_dir.resolve()
-            else:
-                dest_dir = (root / dest_dir).resolve()
-        else:
-            dest_dir = root
+        # -------------------------------------------------------------
+        # Fixed HuggingFace download directory (hfdownload/)
+        # -------------------------------------------------------------
+        hf_root = (root / HF_DOWNLOAD_DIR_NAME).resolve()
 
-        dest_dir = dest_dir.resolve()
-        if not str(dest_dir).startswith(str(root)):
-            raise RuntimeError("Destination directory escapes local_root")
+        # Create hfdownload directory if missing
+        ensure_dir(hf_root)
 
-        dest = dest_dir / filename
+        dest = hf_root / filename
         ensure_parent(dest)
 
-        _ = safe_relpath(dest, root)
+        job_obj.add_log(f"HF download directory = {hf_root}")
+        job_obj.add_log(f"Final download path  = {dest}")
+
+        
 
         job_obj.add_log(f"Downloading => {dest}")
 
@@ -1156,13 +1159,20 @@ HTML_PAGE = r"""
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; padding: 0; }
     header { padding: 12px 16px; border-bottom: 1px solid #ddd; display:flex; gap:16px; align-items:center; justify-content:space-between; }
     h1 { font-size: 16px; margin:0; }
+
+    details { border: 1px solid #eee; border-radius: 10px; padding: 10px; }
+    summary { cursor: pointer; user-select: none; font-weight: 600; }
+    details > summary { list-style: none; }
+    details > summary::-webkit-details-marker { display: none; }
+    .summary-row { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+
     main { padding: 12px 16px; }
     .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 16px; }
     .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; }
     .row { display:flex; gap: 10px; flex-wrap: wrap; align-items:center; }
     label { font-size: 12px; color:#444; display:block; }
     input { padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; min-width: 260px; }
-    button { padding: 7px 10px; border-radius: 8px; border: 1px solid #777; background: #fff; cursor: pointer; }
+    button { padding: 7px 10px; border-radius: 8px; border: 1px solid; color: #777; background: #eee; color: #ff0000; cursor: pointer; }
     button:hover { background:#f5f5f5; }
     .tree {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -1195,6 +1205,7 @@ HTML_PAGE = r"""
     .small { font-size: 11px; color:#666; }
     .syncbar { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
     select { padding:6px 8px; border-radius:8px; border:1px solid #ccc; }
+
   </style>
 </head>
 <body>
@@ -1209,26 +1220,38 @@ HTML_PAGE = r"""
   </div>
 </header>
 
+
 <main>
-  <div class="card">
-    <div class="row">
-      <div>
+
+<div class="card" >
+
+  <!-- =======================
+       Collapsible: Config
+       ======================= -->
+  <details open style="background:#f9f9f9;">
+    <summary>
+        Configuration
+        <span class="muted">— local/remote roots • rsync • ssh • tree depth</span>
+    </summary>
+
+    <div class="row" style="margin-top:10px">
+        <div>
         <label>Local root</label>
         <input id="local_root" placeholder="/opt/ai/models"/>
-      </div>
-      <div>
+        </div>
+        <div>
         <label>Remote URL</label>
         <input id="remote_url" placeholder="http://192.168.1.50:9090"/>
-      </div>
-      <div>
+        </div>
+        <div>
         <label>Remote root</label>
         <input id="remote_root" placeholder="/opt/ai/models"/>
-      </div>
+        </div>
     </div>
 
-    <div class="row">
+    <div class="row" style="margin-top:10px">
       <div style="min-width:280px">
-        <label>mTime strich check</label>
+        <label>mTime strict check</label>
         <input id="mtime_strict" type="checkbox" style="min-width:auto"/>
       </div>
 
@@ -1264,91 +1287,133 @@ HTML_PAGE = r"""
         <label>Tree max depth</label>
         <input id="max_depth" placeholder="6"/>
       </div>
+    </div>
+
+    <div class="row" style="margin-top:10px">  
       <div style="display:flex; align-items:flex-end; gap:8px">
         <button onclick="saveConfig()">Save config</button>
-        <button onclick="refreshTrees()">Refresh trees</button>
       </div>
     </div>
-
-    <div class="row" style="margin-top:12px">
-      <div>
-        <label>Download URL (HuggingFace or any direct URL)</label>
-        <input id="dl_url" placeholder="https://huggingface.co/.../resolve/main/model.safetensors?download=true" style="min-width:740px"/>
-      </div>
-      <div>
-        <label>Download directory (absolute OR relative to local root)</label>
-        <input id="dl_dest" placeholder="flux/ (or /opt/ai/comfy/models/flux/)"/>
-      </div>
-      <div>
-        <label>Where</label>
-        <select id="dl_side">
-          <option value="both">both</option>
-          <option value="local">local</option>
-          <option value="remote">remote</option>
-        </select>
-      </div>
-
-      <div style="display:flex; align-items:flex-end; margin-top:12px; gap:12px">
-        <button onclick="downloadUrl()">Download</button>
-      </div>
-
-      <div>
-        <label>HuggingFace Token (optional)</label>
-        <input id="hf_token" placeholder="hf_..." style="min-width:420px"/>
-      </div>
-    </div>
+  </details>
 
     <div class="row" style="margin-top:10px; justify-content:space-between">
-      <div id="status" class="muted"></div>
-    </div>
+    <div id="status" class="muted"></div>
   </div>
 
-  <div class="grid" style="margin-top:16px">
-    <div class="card">
-      <div class="syncbar" style="justify-content:space-between">
-        <div class="row" style="gap:12px;">
-          <strong>Local</strong>
-          <span class="pill">drag files ➜ Remote dropzone</span>
-        </div>
-        <div class="row" style="gap:10px;">
-          <button onclick="sync('push')">Sync ➜ Remote</button>
-        </div>
-      </div>
+  <!-- =======================
+       Collapsible: HuggingFace
+       ======================= -->
 
-      <div id="tree_local" class="tree"></div>
-      <div id="drop_remote" class="dropzone">
-        Drop here to COPY TO REMOTE (push)
-        <div class="muted">Directories require rsync. Files can use rsync or HTTP.</div>
-      </div>
+  <details open style="margin-top:12px; background:#f9f9f9;">
+    <summary>
+        HuggingFace / URL Download
+        <span class="muted">— download Huggingface file(s)</span>
+    </summary>
+
+    <div class="row" style="margin-top:10px">
+        <div>
+        <label>Download URL</label>
+        <input id="dl_url"
+                placeholder="https://huggingface.co/Qwen/Qwen3/model-00001-of-00040.safetensors"
+                style="min-width:740px"/>
+        </div>
+
+        <div>
+        <label>Download directory</label>
+        <input style="margin-top: 1px;" id="dl_dest" disabled placeholder="fixed output directory: hfdownload/"/>
+
+        </div>
     </div>
 
-    <div class="card">
-      <div class="syncbar" style="justify-content:space-between">
-        <div class="row" style="gap:12px;">
-          <strong>Remote</strong>
-          <span class="pill">drag files ➜ Local dropzone</span>
+    <div class="row" style="margin-top:10px">     
+        <div>
+        <label>HuggingFace Token (optional)</label>
+        <input id="hf_token" placeholder="hf_..." style="min-width:420px"/>
         </div>
-        <div class="row" style="gap:10px;">
-          <button onclick="sync('pull')">Sync ➜ Local</button>
-        </div>
-      </div>
+    </div>    
 
-      <div id="tree_remote" class="tree"></div>
-      <div id="drop_local" class="dropzone">
-        Drop here to COPY TO LOCAL (pull)
-        <div class="muted">Directories require rsync. Files can use rsync or HTTP.</div>
-      </div>
+    <div class="row" style="margin-top:10px">        
+        <div>
+            <label>Where to download</label>
+            <select id="dl_side">
+                <option value="both">both</option>
+                <option value="local">local</option>
+                <option value="remote">remote</option>
+            </select>
+        </div>
     </div>
-  </div>
 
-  <div class="card" style="margin-top:16px">
+    <div class="row" style="margin-top:10px">        
+        <div style="display:flex; align-items:flex-end; gap:12px">
+            <button style="margin-top: 12px;" onclick="downloadUrl()">Download</button>
+        </div>
+    </div>    
+
+  </details>
+
+</div>
+  
+<div class="card" style="margin-top:8px;">
+
+  <details open>
+    <summary>
+        Directory Trees
+        <span class="muted">— view local & remote existing files and directories</span>
+        <div class="row" style="margin-top:10px; gap:10px">
+            <button onclick="refreshTrees()">Refresh trees</button>
+        </div>
+    </summary>
+
+    <div class="grid" style="margin-top:4px">
+        <div class="card">
+        <div class="syncbar" style="justify-content:space-between">
+            <div class="row" style="gap:12px;">
+            <strong>Local</strong>
+            <span class="pill">drag files ➜ Remote dropzone</span>
+            </div>
+            <div class="row" style="gap:10px;">
+            <button onclick="sync('push')">Sync ➜ Remote</button>
+            </div>
+        </div>
+
+        <div id="tree_local" class="tree"></div>
+        <div id="drop_remote" class="dropzone">
+            Drop here to COPY TO REMOTE (push)
+            <div class="muted">Directories require rsync. Files can use rsync or HTTP.</div>
+        </div>
+        </div>
+
+        <div class="card">
+        <div class="syncbar" style="justify-content:space-between">
+            <div class="row" style="gap:12px;">
+            <strong>Remote</strong>
+            <span class="pill">drag files ➜ Local dropzone</span>
+            </div>
+            <div class="row" style="gap:10px;">
+            <button onclick="sync('pull')">Sync ➜ Local</button>
+            </div>
+        </div>
+
+        <div id="tree_remote" class="tree"></div>
+        <div id="drop_local" class="dropzone">
+            Drop here to COPY TO LOCAL (pull)
+            <div class="muted">Directories require rsync. Files can use rsync or HTTP.</div>
+        </div>
+        </div>
+    </div>
+  </details>
+</div>
+  
+<div class="card" style="margin-top:16px">
     <div class="row" style="justify-content:space-between">
       <strong>Jobs</strong>
       <span class="muted">auto-refreshes every 1s</span>
     </div>
     <div id="jobs" class="jobs"></div>
-  </div>
+</div>
+
 </main>
+
 
 <script>
 let dragged = null;
